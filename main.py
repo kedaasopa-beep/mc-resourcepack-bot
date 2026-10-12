@@ -3,7 +3,8 @@
 Telegram-бот для автоматической публикации ресурспаков Minecraft.
 
 Как это работает:
-  1. Модератор отправляет боту .zip ресурспака.
+  1. Модератор отправляет боту .zip ресурспака (или ссылку на него,
+     если файл больше 20 МБ — таково ограничение Telegram Bot API).
   2. Бот скачивает архив во временную папку и распаковывает его.
   3. Читает pack.mcmeta и достаёт pack_format (версию пака).
   4. Отбирает «витрину» текстур: узнаваемые категории (блоки, шерсть,
@@ -17,6 +18,7 @@ Telegram-бот для автоматической публикации рес�
 """
 
 import os
+import re
 import json
 import tempfile
 import zipfile
@@ -25,6 +27,7 @@ import logging
 from collections import Counter
 from pathlib import Path
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -36,6 +39,10 @@ from PIL import Image
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")           # токен бота
 CHANNEL_ID = os.getenv("CHANNEL_ID")         # ID канала (например, -1001234567890)
+
+# Лимиты Telegram Bot API
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024         # бот может скачать из TG только до 20 МБ
+URL_DOWNLOAD_LIMIT = 200 * 1024 * 1024       # предохранитель для загрузки по ссылке
 
 # Параметры превью
 GRID = 4                 # сетка 4x4
@@ -49,6 +56,12 @@ RENDER_3D_BLOCKS = True
 TOP_SHADE = 1.0          # яркость верхней грани
 RIGHT_SHADE = 0.82       # яркость правой грани
 LEFT_SHADE = 0.62        # яркость левой грани
+
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# Ссылки-раздачи transfernow вида .../dl/<code> или ...?code=<code>
+TRANSFERNOW_RE = re.compile(
+    r"transfernow\.net/(?:[^\s?]*?dl/|.*?[?&]code=)([A-Za-z0-9]+)", re.IGNORECASE
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("resourcepack-bot")
@@ -193,9 +206,7 @@ def lookup(index: dict[str, Path], name: str) -> Path | None:
             return index[alias]
     return None
 
-def select_textures(
-    texture_files: list[Path], limit: int
-) -> list[Path]:
+def select_textures(texture_files: list[Path], limit: int) -> list[Path]:
     """
     Подбирает до `limit` текстур для превью.
 
@@ -362,6 +373,167 @@ def build_caption(pack_name: str, pack_format, resolution: tuple[int, int]) -> s
         f"\n#resourcepack"
     )
 
+# --- Загрузка по ссылке ------------------------------------------------------
+
+async def resolve_transfernow(code: str) -> tuple[str, str]:
+    """
+    Превращает раздачу transfernow в прямую ссылку на .zip.
+
+    transfernow отдаёт страницу-просмотр, а реальный файл прячется за API:
+    сначала /metadata (список файлов), затем /link (подписанный URL).
+    """
+    api = "https://www.transfernow.net/api/transfer/downloads"
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(f"{api}/metadata", params={"transferId": code}) as resp:
+            meta = await resp.json(content_type=None)
+
+        if meta.get("needPassword"):
+            raise ValueError("Эта передача transfernow защищена паролем — сними пароль.")
+
+        files = meta.get("files") or []
+        zip_file = next(
+            (f for f in files if str(f.get("name", "")).lower().endswith(".zip")), None
+        )
+        if not zip_file:
+            raise ValueError("В передаче transfernow нет .zip файла.")
+
+        async with session.get(
+            f"{api}/link", params={"transferId": code, "fileId": zip_file["id"]}
+        ) as resp:
+            data = await resp.json(content_type=None)
+
+    direct = data.get("url")
+    if not direct:
+        raise ValueError("transfernow не вернул ссылку на файл.")
+    return str(zip_file["name"]), direct
+
+async def download_url(url: str, dest: Path, max_bytes: int) -> int:
+    """Скачивает файл по HTTP(S) потоково, с контролем размера. Возвращает размер."""
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            total = 0
+            first = b""
+            with dest.open("wb") as f:
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("Файл по ссылке слишком большой.")
+                    if len(first) < 512:
+                        first += chunk[: 512 - len(first)]
+                    f.write(chunk)
+
+    # Если вместо файла отдалась HTML-страница — это страница просмотра, не прямая ссылка
+    head = first.lstrip()[:200].lower()
+    if b"<!doctype html" in head or head.startswith(b"<html"):
+        raise ValueError(
+            "По ссылке отдаётся веб-страница, а не файл. Нужна **прямая** ссылка на .zip "
+            "(например, с 0x0.st, catbox.moe, transfernow — transfernow бот понимает сам)."
+        )
+    return total
+
+# --- Основная обработка пакета ------------------------------------------------
+
+async def process_pack(
+    bot: Bot, status: Message, zip_path: Path, file_name: str, tmp_path: Path
+) -> None:
+    """Распаковка, сборка превью и публикация. Общая логика для файла и ссылки."""
+    extract_dir = tmp_path / "unpacked"
+    extract_dir.mkdir(exist_ok=True)
+
+    # 2. Распаковка
+    await status.edit_text("📦 Распаковываю архив...")
+    try:
+        safe_extract(zip_path, extract_dir)
+    except zipfile.BadZipFile:
+        await status.edit_text("❌ Архив повреждён или это не ZIP-файл.")
+        return
+    except Exception:
+        logger.exception("Ошибка распаковки")
+        await status.edit_text("❌ Не удалось распаковать архив.")
+        return
+
+    file_count = sum(1 for p in extract_dir.rglob("*") if p.is_file())
+    logger.info("Архив распакован: %d файлов", file_count)
+
+    # 3. Чтение pack.mcmeta
+    mcmeta = find_pack_mcmeta(extract_dir)
+    if mcmeta is None:
+        await status.edit_text(
+            "❌ В архиве не найден `pack.mcmeta`. Убедись, что это валидный ресурспак."
+        )
+        return
+    try:
+        pack_format = read_pack_format(mcmeta)
+    except Exception:
+        logger.exception("Ошибка чтения pack.mcmeta")
+        await status.edit_text("❌ Не удалось прочитать pack.mcmeta (некорректный JSON).")
+        return
+    logger.info("pack.mcmeta: %s, pack_format=%s", mcmeta, pack_format)
+
+    # 4. Поиск текстур: витрина из узнаваемых категорий (блоки/шерсть/оружие/броня)
+    await status.edit_text("🖼 Собираю превью...")
+    texture_files = find_texture_files(extract_dir)
+    logger.info("Найдено PNG-текстур всего: %d", len(texture_files))
+
+    selected = select_textures(texture_files, MAX_TEXTURES)
+    logger.info("Отобрано для коллажа: %d", len(selected))
+    for png in selected:
+        logger.info("  %s", png.relative_to(extract_dir))
+
+    if not selected:
+        await status.edit_text(
+            "❌ В архиве не найдено подходящих PNG-текстур "
+            "(папка textures отсутствует или пуста)."
+        )
+        return
+
+    # 5. Разрешение и коллаж
+    try:
+        resolution = detect_resolution(selected)
+        collage = build_collage(selected)
+    except Exception:
+        logger.exception("Ошибка сборки коллажа")
+        await status.edit_text("❌ Не удалось обработать PNG-текстуры.")
+        return
+
+    preview_path = tmp_path / "preview.png"
+    # Убираем альфа-канал перед отправкой фото (Telegram не любит RGBA в JPEG/фото)
+    collage.convert("RGB").save(preview_path, format="PNG")
+
+    # 6. Публикация в канал
+    pack_name = Path(file_name).stem
+    caption = build_caption(pack_name, pack_format, resolution)
+
+    await status.edit_text("📤 Публикую в канал...")
+    try:
+        await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=FSInputFile(preview_path),
+            caption=caption,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await bot.send_document(
+            chat_id=CHANNEL_ID,
+            document=FSInputFile(zip_path, filename=file_name),
+        )
+    except Exception:
+        logger.exception("Ошибка публикации в канал")
+        await status.edit_text(
+            "❌ Не удалось опубликовать в канал. Проверь, что бот — админ канала "
+            "и CHANNEL_ID указан верно."
+        )
+        return
+
+    # 7. Подтверждение модератору
+    await status.edit_text(
+        f"✅ Опубликовано\n"
+        f"Текстур в превью: {len(selected)}\n"
+        f"pack_format: {pack_format if pack_format is not None else 'не указан'}"
+    )
+
 # --- Хэндлеры -----------------------------------------------------------------
 
 dp = Dispatcher()
@@ -370,33 +542,39 @@ dp = Dispatcher()
 async def cmd_start(message: Message) -> None:
     """Приветствие для модератора."""
     await message.answer(
-        "Отправь мне .zip файл ресурспака — я соберу превью и опубликую его в канал."
+        "Отправь мне .zip файл ресурспака — я соберу превью и опубликую его в канал.\n\n"
+        "Если архив больше 20 МБ, Telegram не даст боту его скачать: тогда пришли ссылку "
+        "на .zip (поддерживаются прямые ссылки и раздачи transfernow)."
     )
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot) -> None:
-    """Основная логика: приём zip, обработка и публикация."""
+    """Приём zip-файла (Telegram Bot API даёт скачать только до 20 МБ)."""
     document = message.document
     file_name = document.file_name or "resourcepack.zip"
 
-    # Принимаем только zip
     if not file_name.lower().endswith(".zip"):
         await message.answer("❌ Нужен файл формата .zip (ресурспак Minecraft).")
         return
 
-    # Обрабатываем во временной папке, которая удалится автоматически
+    size = document.file_size or 0
+    if size > TG_DOWNLOAD_LIMIT:
+        await message.answer(
+            f"⚠️ Файл {size / (1024 * 1024):.1f} МБ — больше лимита Telegram (20 МБ), "
+            f"бот не может его скачать.\n\n"
+            f"Залей архив на Google Drive / Яндекс.Диск / любой файлхостинг и пришли "
+            f"прямую ссылку на .zip."
+        )
+        return
+
     with tempfile.TemporaryDirectory(prefix="rp_") as tmp:
         tmp_path = Path(tmp)
         zip_path = tmp_path / file_name
-        extract_dir = tmp_path / "unpacked"
-        extract_dir.mkdir()
 
-        # 1. Скачивание файла
-        size_mb = (document.file_size or 0) / (1024 * 1024)
+        size_mb = size / (1024 * 1024)
         logger.info("Получен файл %s (%.1f МБ)", file_name, size_mb)
         status = await message.answer(f"⏳ Скачиваю архив ({size_mb:.1f} МБ)...")
         try:
-            # Таймаут, чтобы бот не «висел» бесконечно при проблемах с сетью
             await asyncio.wait_for(
                 bot.download(document, destination=zip_path), timeout=120
             )
@@ -410,94 +588,64 @@ async def handle_document(message: Message, bot: Bot) -> None:
             return
         logger.info("Файл скачан: %s (%d байт)", zip_path.name, zip_path.stat().st_size)
 
-        # 2. Распаковка
+        await process_pack(bot, status, zip_path, file_name, tmp_path)
+
+@dp.message(F.text)
+async def handle_url(message: Message, bot: Bot) -> None:
+    """Приём прямой ссылки на zip (для архивов больше 20 МБ)."""
+    text = message.text or ""
+    logger.info("Текстовое сообщение: %r", text)
+    match = URL_RE.search(text)
+    if not match:
+        return
+    url = match.group(0)
+
+    # Имя файла берём из конца ссылки (без query-параметров)
+    name_from_url = url.split("?")[0].rstrip("/").split("/")[-1] or "resourcepack"
+    file_name = name_from_url if name_from_url.lower().endswith(".zip") else f"{name_from_url}.zip"
+
+    with tempfile.TemporaryDirectory(prefix="rp_") as tmp:
+        tmp_path = Path(tmp)
+        status = await message.answer("⏳ Скачиваю архив по ссылке...")
+
+        # Ссылки-раздачи transfernow требуют обращения к API за прямой ссылкой
+        tn = TRANSFERNOW_RE.search(url)
+        if tn:
+            await status.edit_text("🔎 Разбираю передачу transfernow...")
+            try:
+                file_name, url = await resolve_transfernow(tn.group(1))
+                logger.info("transfernow: %s -> %s", file_name, url)
+            except ValueError as exc:
+                await status.edit_text(f"❌ {exc}")
+                return
+            except Exception:
+                logger.exception("Ошибка разбора transfernow")
+                await status.edit_text("❌ Не удалось получить файл из раздачи transfernow.")
+                return
+
+        zip_path = tmp_path / file_name
+
+        logger.info("Скачивание по ссылке: %s", url)
         try:
-            safe_extract(zip_path, extract_dir)
-        except zipfile.BadZipFile:
-            await status.edit_text("❌ Архив повреждён или это не ZIP-файл.")
+            total = await asyncio.wait_for(
+                download_url(url, zip_path, URL_DOWNLOAD_LIMIT), timeout=600
+            )
+        except asyncio.TimeoutError:
+            logger.exception("Таймаут скачивания по ссылке")
+            await status.edit_text("❌ Ссылка не ответила вовремя. Попробуй ещё раз.")
+            return
+        except ValueError as exc:
+            await status.edit_text(f"❌ {exc}")
             return
         except Exception:
-            logger.exception("Ошибка распаковки")
-            await status.edit_text("❌ Не удалось распаковать архив.")
-            return
-
-        file_count = sum(1 for p in extract_dir.rglob("*") if p.is_file())
-        logger.info("Архив распакован: %d файлов", file_count)
-
-        # 3. Чтение pack.mcmeta
-        mcmeta = find_pack_mcmeta(extract_dir)
-        if mcmeta is None:
+            logger.exception("Ошибка скачивания по ссылке")
             await status.edit_text(
-                "❌ В архиве не найден `pack.mcmeta`. Убедись, что это валидный ресурспак."
+                "❌ Не удалось скачать по ссылке. Проверь, что она открывается и ведёт на .zip."
             )
             return
-        try:
-            pack_format = read_pack_format(mcmeta)
-        except Exception:
-            logger.exception("Ошибка чтения pack.mcmeta")
-            await status.edit_text("❌ Не удалось прочитать pack.mcmeta (некорректный JSON).")
-            return
-        logger.info("pack.mcmeta: %s, pack_format=%s", mcmeta, pack_format)
+        logger.info("Скачано по ссылке: %s (%d байт)", zip_path.name, total)
 
-        # 4. Поиск текстур: витрина из узнаваемых категорий (блоки/шерсть/оружие/броня)
-        await status.edit_text("🖼 Собираю превью...")
-        texture_files = find_texture_files(extract_dir)
-        logger.info("Найдено PNG-текстур всего: %d", len(texture_files))
-
-        selected = select_textures(texture_files, MAX_TEXTURES)
-        logger.info("Отобрано для коллажа: %d", len(selected))
-        for png in selected:
-            logger.info("  %s", png.relative_to(extract_dir))
-
-        if not selected:
-            await status.edit_text(
-                "❌ В архиве не найдено подходящих PNG-текстур "
-                "(папка textures отсутствует или пуста)."
-            )
-            return
-
-        # 5. Разрешение и коллаж
-        try:
-            resolution = detect_resolution(selected)
-            collage = build_collage(selected)
-        except Exception:
-            logger.exception("Ошибка сборки коллажа")
-            await status.edit_text("❌ Не удалось обработать PNG-текстуры.")
-            return
-
-        preview_path = tmp_path / "preview.png"
-        # Убираем альфа-канал перед отправкой фото (Telegram не любит RGBA в JPEG/фото)
-        collage.convert("RGB").save(preview_path, format="PNG")
-
-        # 6. Публикация в канал
-        pack_name = Path(file_name).stem
-        caption = build_caption(pack_name, pack_format, resolution)
-
-        try:
-            await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=FSInputFile(preview_path),
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            await bot.send_document(
-                chat_id=CHANNEL_ID,
-                document=FSInputFile(zip_path, filename=file_name),
-            )
-        except Exception:
-            logger.exception("Ошибка публикации в канал")
-            await status.edit_text(
-                "❌ Не удалось опубликовать в канал. Проверь, что бот — админ канала "
-                "и CHANNEL_ID указан верно."
-            )
-            return
-
-        # 7. Подтверждение модератору
-        await status.edit_text(
-            f"✅ Опубликовано\n"
-            f"Текстур в превью: {len(selected)}\n"
-            f"pack_format: {pack_format if pack_format is not None else 'не указан'}"
-        )
+        await process_pack(bot, status, zip_path, file_name, tmp_path)
 
 # --- Точка входа --------------------------------------------------------------
 
