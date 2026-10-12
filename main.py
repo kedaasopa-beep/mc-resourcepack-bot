@@ -9,6 +9,7 @@ Telegram-бот для автоматической публикации рес�
   4. Отбирает «витрину» текстур: узнаваемые категории (блоки, шерсть,
      оружие/инструменты, броня), отсеивая служебный мусор и анимации.
   5. Собирает коллаж-превью 4x4 (ячейки 64x64, тёмный фон, отступы 8px).
+     Блоки рисуются объёмными изометрическими кубами, предметы — спрайтами.
   6. Публикует в канал: сначала фото-превью с подписью, затем сам .zip.
   7. Отправляет модератору подтверждение "✅ Опубликовано".
 
@@ -42,6 +43,12 @@ CELL = 64                # размер одной ячейки
 PAD = 8                  # отступы (внешние и между ячейками)
 MAX_TEXTURES = 16        # максимум текстур в коллаже (4x4)
 BG_COLOR = (32, 32, 32, 255)  # тёмный фон коллажа
+
+# Объёмный рендер блоков (изометрический куб) вместо плоских текстур
+RENDER_3D_BLOCKS = True
+TOP_SHADE = 1.0          # яркость верхней грани
+RIGHT_SHADE = 0.82       # яркость правой грани
+LEFT_SHADE = 0.62        # яркость левой грани
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("resourcepack-bot")
@@ -229,6 +236,82 @@ def select_textures(
 
 # --- Построение коллажа ------------------------------------------------------
 
+def is_block_texture(png: Path) -> bool:
+    """Определяет, что текстура лежит в блоковой папке (block/blocks)."""
+    parts = [part.lower() for part in png.parts]
+    return "block" in parts or "blocks" in parts
+
+def _shade(img: Image.Image, factor: float) -> Image.Image:
+    """Затемняет RGB-каналы с сохранением прозрачности (имитация освещения)."""
+    if factor >= 0.999:
+        return img
+    r, g, b, a = img.split()
+    r = r.point(lambda v: int(v * factor))
+    g = g.point(lambda v: int(v * factor))
+    b = b.point(lambda v: int(v * factor))
+    return Image.merge("RGBA", (r, g, b, a))
+
+def render_block_3d(texture: Image.Image, cell: int) -> Image.Image:
+    """
+    Рисует объёмный изометрический куб из одной текстуры.
+
+    Верхняя грань — ромб (2:1), боковые грани — параллелограммы,
+    затемнённые по-разному, чтобы читался объём. Всё через аффинные
+    преобразования с Image.NEAREST, чтобы пиксель-арт не мылился.
+    """
+    s = max(2, cell // 2)      # сторона грани в пикселях
+    size = (2 * s, 2 * s)      # куб вписан в квадрат cell x cell
+    src = texture.convert("RGBA").resize((s, s), Image.NEAREST)
+
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+
+    # Верхняя грань: квадрат -> ромб (ширина 2s, высота s)
+    top = src.transform(
+        (2 * s, s),
+        Image.AFFINE,
+        (0.5, 1.0, -s / 2, -0.5, 1.0, s / 2),
+        resample=Image.NEAREST,
+        fillcolor=(0, 0, 0, 0),
+    )
+    canvas.alpha_composite(_shade(top, TOP_SHADE), (0, 0))
+
+    # Правая грань (справа от ближнего угла)
+    right = src.transform(
+        size,
+        Image.AFFINE,
+        (-1.0, 0.0, 2 * s, 0.5, 1.0, -1.5 * s),
+        resample=Image.NEAREST,
+        fillcolor=(0, 0, 0, 0),
+    )
+    canvas.alpha_composite(_shade(right, RIGHT_SHADE), (0, 0))
+
+    # Левая грань (слева от ближнего угла)
+    left = src.transform(
+        (s, 2 * s),
+        Image.AFFINE,
+        (1.0, 0.0, 0.0, -0.5, 1.0, -s / 2),
+        resample=Image.NEAREST,
+        fillcolor=(0, 0, 0, 0),
+    )
+    canvas.alpha_composite(_shade(left, LEFT_SHADE), (0, 0))
+
+    return canvas
+
+def render_texture(png: Path, cell: int) -> Image.Image:
+    """Готовит одну текстуру для ячейки: блоки — кубом, предметы — спрайтом."""
+    with Image.open(png) as raw:
+        tex = raw.convert("RGBA")
+
+    if RENDER_3D_BLOCKS and is_block_texture(png):
+        return render_block_3d(tex, cell)
+
+    # Плоские спрайты (предметы, броня) — вписываем с сохранением пропорций
+    ratio = min(cell / tex.width, cell / tex.height)
+    new_size = (max(1, round(tex.width * ratio)), max(1, round(tex.height * ratio)))
+    if new_size != tex.size:
+        tex = tex.resize(new_size, Image.NEAREST)
+    return tex
+
 def build_collage(png_paths: list[Path]) -> Image.Image:
     """Собирает коллаж из PNG-текстур с сохранением прозрачности и пропорций."""
     # Итоговый размер: (cols + 1) отступов + cols ячеек
@@ -241,13 +324,7 @@ def build_collage(png_paths: list[Path]) -> Image.Image:
         x = PAD + col * (CELL + PAD)
         y = PAD + row * (CELL + PAD)
 
-        with Image.open(png) as raw:
-            tex = raw.convert("RGBA")
-            # Вписываем текстуру в ячейку, сохраняя пропорции (без мыла -> NEAREST)
-            ratio = min(CELL / tex.width, CELL / tex.height)
-            new_size = (max(1, round(tex.width * ratio)), max(1, round(tex.height * ratio)))
-            if new_size != tex.size:
-                tex = tex.resize(new_size, Image.NEAREST)
+        tex = render_texture(png, CELL)
 
         # Центрируем внутри ячейки и вставляем с учётом альфа-канала
         offset_x = x + (CELL - tex.width) // 2
@@ -443,4 +520,4 @@ async def main() -> None:
         await bot.session.close()
 
 if __name__ == "__main__":
-    asyncio.run
+    asyncio.run(main())
