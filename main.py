@@ -66,6 +66,7 @@ TRANSFERNOW_RE = re.compile(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("resourcepack-bot")
 
+
 # --- Работа с архивом --------------------------------------------------------
 
 def safe_extract(zip_path: Path, dest: Path) -> None:
@@ -78,6 +79,7 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
                 raise ValueError("Архив содержит недопустимые пути (zip-slip).")
         zf.extractall(dest)
 
+
 def find_pack_mcmeta(root: Path) -> Path | None:
     """Находит pack.mcmeta в архиве (в том числе во вложенной папке)."""
     candidates = list(root.rglob("pack.mcmeta"))
@@ -87,12 +89,14 @@ def find_pack_mcmeta(root: Path) -> Path | None:
     candidates.sort(key=lambda p: len(p.relative_to(root).parts))
     return candidates[0]
 
+
 def read_pack_format(mcmeta: Path) -> int | None:
     """Читает pack_format из pack.mcmeta. Возвращает None, если поля нет."""
     with mcmeta.open("r", encoding="utf-8") as f:
         data = json.load(f)
     pack_section = data.get("pack", {})
     return pack_section.get("pack_format")
+
 
 def find_texture_files(root: Path) -> list[Path]:
     """
@@ -113,6 +117,7 @@ def find_texture_files(root: Path) -> list[Path]:
             if p.is_file() and p.name.lower() not in ("pack.png", "icon.png")
         ]
     return pngs
+
 
 # --- Умный отбор текстур для «витрины» превью --------------------------------
 #
@@ -172,6 +177,7 @@ GROUPS = (
     )),
 )
 
+
 def is_junk(png: Path) -> bool:
     """Отсеивает служебные и анимированные текстуры (particle, gui, fire и т.п.)."""
     stem = png.stem.lower()
@@ -183,6 +189,7 @@ def is_junk(png: Path) -> bool:
     if png.with_suffix(".png.mcmeta").exists():
         return True
     return False
+
 
 def build_index(png_files: list[Path], *dirs: Path | None) -> dict[str, Path]:
     """Индексирует PNG по имени (без расширения). Папки `dirs` — приоритетные."""
@@ -197,6 +204,7 @@ def build_index(png_files: list[Path], *dirs: Path | None) -> dict[str, Path]:
         index.setdefault(png.stem.lower(), png)
     return index
 
+
 def lookup(index: dict[str, Path], name: str) -> Path | None:
     """Ищет текстуру по имени с учётом легаси-алиасов (шерсть, броня и т.п.)."""
     if name in index:
@@ -205,6 +213,7 @@ def lookup(index: dict[str, Path], name: str) -> Path | None:
         if alias in index:
             return index[alias]
     return None
+
 
 def select_textures(texture_files: list[Path], limit: int) -> list[Path]:
     """
@@ -245,12 +254,14 @@ def select_textures(texture_files: list[Path], limit: int) -> list[Path]:
 
     return selected[:limit]
 
+
 # --- Построение коллажа ------------------------------------------------------
 
 def is_block_texture(png: Path) -> bool:
     """Определяет, что текстура лежит в блоковой папке (block/blocks)."""
     parts = [part.lower() for part in png.parts]
     return "block" in parts or "blocks" in parts
+
 
 def _shade(img: Image.Image, factor: float) -> Image.Image:
     """Затемняет RGB-каналы с сохранением прозрачности (имитация освещения)."""
@@ -261,6 +272,7 @@ def _shade(img: Image.Image, factor: float) -> Image.Image:
     g = g.point(lambda v: int(v * factor))
     b = b.point(lambda v: int(v * factor))
     return Image.merge("RGBA", (r, g, b, a))
+
 
 def render_block_3d(texture: Image.Image, cell: int) -> Image.Image:
     """
@@ -308,6 +320,7 @@ def render_block_3d(texture: Image.Image, cell: int) -> Image.Image:
 
     return canvas
 
+
 def render_texture(png: Path, cell: int) -> Image.Image:
     """Готовит одну текстуру для ячейки: блоки — кубом, предметы — спрайтом."""
     with Image.open(png) as raw:
@@ -322,6 +335,7 @@ def render_texture(png: Path, cell: int) -> Image.Image:
     if new_size != tex.size:
         tex = tex.resize(new_size, Image.NEAREST)
     return tex
+
 
 def build_collage(png_paths: list[Path]) -> Image.Image:
     """Собирает коллаж из PNG-текстур с сохранением прозрачности и пропорций."""
@@ -344,6 +358,7 @@ def build_collage(png_paths: list[Path]) -> Image.Image:
 
     return collage
 
+
 def detect_resolution(png_paths: list[Path]) -> tuple[int, int]:
     """Определяет типичное разрешение текстур (самый частый размер)."""
     sizes = []
@@ -354,6 +369,7 @@ def detect_resolution(png_paths: list[Path]) -> tuple[int, int]:
         return (0, 0)
     return Counter(sizes).most_common(1)[0][0]
 
+
 # --- Текст подписи -----------------------------------------------------------
 
 def escape_md(text: str) -> str:
@@ -361,6 +377,7 @@ def escape_md(text: str) -> str:
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, "\\" + ch)
     return text
+
 
 def build_caption(pack_name: str, pack_format, resolution: tuple[int, int]) -> str:
     """Формирует подпись под фото в Markdown."""
@@ -372,6 +389,7 @@ def build_caption(pack_name: str, pack_format, resolution: tuple[int, int]) -> s
         f"Разрешение: `{width}x{height}`\n"
         f"\n#resourcepack"
     )
+
 
 # --- Загрузка по ссылке ------------------------------------------------------
 
@@ -408,6 +426,7 @@ async def resolve_transfernow(code: str) -> tuple[str, str]:
         raise ValueError("transfernow не вернул ссылку на файл.")
     return str(zip_file["name"]), direct
 
+
 async def download_url(url: str, dest: Path, max_bytes: int) -> int:
     """Скачивает файл по HTTP(S) потоково, с контролем размера. Возвращает размер."""
     timeout = aiohttp.ClientTimeout(total=600)
@@ -433,6 +452,7 @@ async def download_url(url: str, dest: Path, max_bytes: int) -> int:
             "(например, с 0x0.st, catbox.moe, transfernow — transfernow бот понимает сам)."
         )
     return total
+
 
 # --- Основная обработка пакета ------------------------------------------------
 
@@ -534,9 +554,21 @@ async def process_pack(
         f"pack_format: {pack_format if pack_format is not None else 'не указан'}"
     )
 
+
 # --- Хэндлеры -----------------------------------------------------------------
 
 dp = Dispatcher()
+
+
+@dp.update.outer_middleware()
+async def log_updates(handler, event, data):
+    """Диагностика: логирует тип каждого входящего апдейта от Telegram."""
+    try:
+        logger.info("Входящий апдейт: %s", type(event).__name__)
+    except Exception:
+        pass
+    return await handler(event, data)
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -546,6 +578,7 @@ async def cmd_start(message: Message) -> None:
         "Если архив больше 20 МБ, Telegram не даст боту его скачать: тогда пришли ссылку "
         "на .zip (поддерживаются прямые ссылки и раздачи transfernow)."
     )
+
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot) -> None:
@@ -589,6 +622,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         logger.info("Файл скачан: %s (%d байт)", zip_path.name, zip_path.stat().st_size)
 
         await process_pack(bot, status, zip_path, file_name, tmp_path)
+
 
 @dp.message(F.text)
 async def handle_url(message: Message, bot: Bot) -> None:
@@ -647,6 +681,18 @@ async def handle_url(message: Message, bot: Bot) -> None:
 
         await process_pack(bot, status, zip_path, file_name, tmp_path)
 
+
+@dp.message()
+async def handle_any(message: Message, bot: Bot) -> None:
+    """Ловит все прочие сообщения (если F.text/F.document не сработали)."""
+    logger.info(
+        "Необработанное сообщение: type=%s, text=%r, caption=%r",
+        message.content_type,
+        message.text,
+        message.caption,
+    )
+
+
 # --- Точка входа --------------------------------------------------------------
 
 async def main() -> None:
@@ -666,6 +712,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
