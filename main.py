@@ -46,7 +46,6 @@ BG_COLOR = (32, 32, 32, 255)  # тёмный фон коллажа
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("resourcepack-bot")
 
-
 # --- Работа с архивом --------------------------------------------------------
 
 def safe_extract(zip_path: Path, dest: Path) -> None:
@@ -59,7 +58,6 @@ def safe_extract(zip_path: Path, dest: Path) -> None:
                 raise ValueError("Архив содержит недопустимые пути (zip-slip).")
         zf.extractall(dest)
 
-
 def find_pack_mcmeta(root: Path) -> Path | None:
     """Находит pack.mcmeta в архиве (в том числе во вложенной папке)."""
     candidates = list(root.rglob("pack.mcmeta"))
@@ -69,14 +67,12 @@ def find_pack_mcmeta(root: Path) -> Path | None:
     candidates.sort(key=lambda p: len(p.relative_to(root).parts))
     return candidates[0]
 
-
 def read_pack_format(mcmeta: Path) -> int | None:
     """Читает pack_format из pack.mcmeta. Возвращает None, если поля нет."""
     with mcmeta.open("r", encoding="utf-8") as f:
         data = json.load(f)
     pack_section = data.get("pack", {})
     return pack_section.get("pack_format")
-
 
 def find_texture_files(root: Path) -> list[Path]:
     """
@@ -97,7 +93,6 @@ def find_texture_files(root: Path) -> list[Path]:
             if p.is_file() and p.name.lower() not in ("pack.png", "icon.png")
         ]
     return pngs
-
 
 # --- Умный отбор текстур для «витрины» превью --------------------------------
 #
@@ -157,7 +152,6 @@ GROUPS = (
     )),
 )
 
-
 def is_junk(png: Path) -> bool:
     """Отсеивает служебные и анимированные текстуры (particle, gui, fire и т.п.)."""
     stem = png.stem.lower()
@@ -169,7 +163,6 @@ def is_junk(png: Path) -> bool:
     if png.with_suffix(".png.mcmeta").exists():
         return True
     return False
-
 
 def build_index(png_files: list[Path], *dirs: Path | None) -> dict[str, Path]:
     """Индексирует PNG по имени (без расширения). Папки `dirs` — приоритетные."""
@@ -184,7 +177,6 @@ def build_index(png_files: list[Path], *dirs: Path | None) -> dict[str, Path]:
         index.setdefault(png.stem.lower(), png)
     return index
 
-
 def lookup(index: dict[str, Path], name: str) -> Path | None:
     """Ищет текстуру по имени с учётом легаси-алиасов (шерсть, броня и т.п.)."""
     if name in index:
@@ -193,7 +185,6 @@ def lookup(index: dict[str, Path], name: str) -> Path | None:
         if alias in index:
             return index[alias]
     return None
-
 
 def select_textures(
     texture_files: list[Path], limit: int
@@ -236,7 +227,6 @@ def select_textures(
 
     return selected[:limit]
 
-
 # --- Построение коллажа ------------------------------------------------------
 
 def build_collage(png_paths: list[Path]) -> Image.Image:
@@ -266,7 +256,6 @@ def build_collage(png_paths: list[Path]) -> Image.Image:
 
     return collage
 
-
 def detect_resolution(png_paths: list[Path]) -> tuple[int, int]:
     """Определяет типичное разрешение текстур (самый частый размер)."""
     sizes = []
@@ -277,7 +266,6 @@ def detect_resolution(png_paths: list[Path]) -> tuple[int, int]:
         return (0, 0)
     return Counter(sizes).most_common(1)[0][0]
 
-
 # --- Текст подписи -----------------------------------------------------------
 
 def escape_md(text: str) -> str:
@@ -285,7 +273,6 @@ def escape_md(text: str) -> str:
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, "\\" + ch)
     return text
-
 
 def build_caption(pack_name: str, pack_format, resolution: tuple[int, int]) -> str:
     """Формирует подпись под фото в Markdown."""
@@ -298,11 +285,9 @@ def build_caption(pack_name: str, pack_format, resolution: tuple[int, int]) -> s
         f"\n#resourcepack"
     )
 
-
 # --- Хэндлеры -----------------------------------------------------------------
 
 dp = Dispatcher()
-
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -310,7 +295,6 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Отправь мне .zip файл ресурспака — я соберу превью и опубликую его в канал."
     )
-
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot) -> None:
@@ -331,13 +315,23 @@ async def handle_document(message: Message, bot: Bot) -> None:
         extract_dir.mkdir()
 
         # 1. Скачивание файла
-        status = await message.answer("⏳ Скачиваю архив...")
+        size_mb = (document.file_size or 0) / (1024 * 1024)
+        logger.info("Получен файл %s (%.1f МБ)", file_name, size_mb)
+        status = await message.answer(f"⏳ Скачиваю архив ({size_mb:.1f} МБ)...")
         try:
-            await bot.download(document, destination=zip_path)
+            # Таймаут, чтобы бот не «висел» бесконечно при проблемах с сетью
+            await asyncio.wait_for(
+                bot.download(document, destination=zip_path), timeout=120
+            )
+        except asyncio.TimeoutError:
+            logger.exception("Таймаут скачивания")
+            await status.edit_text("❌ Скачивание заняло слишком долго. Попробуй ещё раз.")
+            return
         except Exception:
             logger.exception("Ошибка скачивания")
             await status.edit_text("❌ Не удалось скачать файл. Попробуй ещё раз.")
             return
+        logger.info("Файл скачан: %s (%d байт)", zip_path.name, zip_path.stat().st_size)
 
         # 2. Распаковка
         try:
@@ -349,6 +343,9 @@ async def handle_document(message: Message, bot: Bot) -> None:
             logger.exception("Ошибка распаковки")
             await status.edit_text("❌ Не удалось распаковать архив.")
             return
+
+        file_count = sum(1 for p in extract_dir.rglob("*") if p.is_file())
+        logger.info("Архив распакован: %d файлов", file_count)
 
         # 3. Чтение pack.mcmeta
         mcmeta = find_pack_mcmeta(extract_dir)
@@ -363,12 +360,17 @@ async def handle_document(message: Message, bot: Bot) -> None:
             logger.exception("Ошибка чтения pack.mcmeta")
             await status.edit_text("❌ Не удалось прочитать pack.mcmeta (некорректный JSON).")
             return
+        logger.info("pack.mcmeta: %s, pack_format=%s", mcmeta, pack_format)
 
         # 4. Поиск текстур: витрина из узнаваемых категорий (блоки/шерсть/оружие/броня)
         await status.edit_text("🖼 Собираю превью...")
         texture_files = find_texture_files(extract_dir)
+        logger.info("Найдено PNG-текстур всего: %d", len(texture_files))
 
         selected = select_textures(texture_files, MAX_TEXTURES)
+        logger.info("Отобрано для коллажа: %d", len(selected))
+        for png in selected:
+            logger.info("  %s", png.relative_to(extract_dir))
 
         if not selected:
             await status.edit_text(
@@ -420,7 +422,6 @@ async def handle_document(message: Message, bot: Bot) -> None:
             f"pack_format: {pack_format if pack_format is not None else 'не указан'}"
         )
 
-
 # --- Точка входа --------------------------------------------------------------
 
 async def main() -> None:
@@ -441,6 +442,5 @@ async def main() -> None:
     finally:
         await bot.session.close()
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run
