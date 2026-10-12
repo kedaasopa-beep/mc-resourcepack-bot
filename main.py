@@ -78,12 +78,25 @@ def read_pack_format(mcmeta: Path) -> int | None:
     return pack_section.get("pack_format")
 
 
-def find_textures_dir(root: Path, folder_name: str) -> Path | None:
-    """Ищет папку textures/<folder_name> (block или item) в распакованном архиве."""
-    for path in root.rglob(folder_name):
-        if path.is_dir() and path.parent.name == "textures":
-            return path
-    return None
+def find_texture_files(root: Path) -> list[Path]:
+    """
+    Находит PNG-текстуры независимо от структуры пака.
+
+    Сначала собирает всё под любой папкой `textures` (регистр не важен,
+    работает и для Java, и для Bedrock). Если такой папки нет вовсе —
+    берёт любые PNG, кроме иконки пака.
+    """
+    pngs: list[Path] = []
+    for directory in root.rglob("*"):
+        if directory.is_dir() and directory.name.lower() == "textures":
+            pngs.extend(p for p in directory.rglob("*.png") if p.is_file())
+
+    if not pngs:
+        pngs = [
+            p for p in root.rglob("*.png")
+            if p.is_file() and p.name.lower() not in ("pack.png", "icon.png")
+        ]
+    return pngs
 
 
 # --- Умный отбор текстур для «витрины» превью --------------------------------
@@ -93,18 +106,35 @@ def find_textures_dir(root: Path, folder_name: str) -> Path | None:
 
 # Слова в имени файла, которые означают «не показывать в превью»
 JUNK_MARKERS = (
-    "destroy_stage", "particle", "debug", "blur", "flow", "still",
-    "_overlay", "spawn_egg", "gui", "font", "logo", "paint",
+    "destroy_stage", "particle", "debug", "blur", "spawn_egg",
+    "_overlay", "gui", "font", "logo", "paint",
+    "water_flow", "water_still", "lava_flow", "lava_still",
     "fire_", "campfire_fire", "soul_fire",
 )
 
-# Легаси-имена шерсти (до 1.13) для плавного фолбэка
+# Легаси-имена (Minecraft 1.8–1.12) для плавного фолбэка: modern -> legacy
 _WOOL_COLORS = (
     "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink",
     "gray", "light_gray", "cyan", "purple", "blue", "brown", "green",
     "red", "black",
 )
-ALIASES = {f"{color}_wool": f"wool_colored_{color}" for color in _WOOL_COLORS}
+ALIASES: dict[str, tuple[str, ...]] = {
+    # шерсть: white_wool -> wool_colored_white
+    **{f"{color}_wool": (f"wool_colored_{color}",) for color in _WOOL_COLORS},
+    # броня 1.8.9 лежит единым листом models/armor/<материал>_layer_1|2.png
+    "diamond_chestplate": ("diamond_layer_1",),
+    "diamond_leggings": ("diamond_layer_1",),
+    "diamond_helmet": ("diamond_layer_2",),
+    "diamond_boots": ("diamond_layer_2",),
+    "iron_chestplate": ("iron_layer_1",),
+    "iron_leggings": ("iron_layer_1",),
+    "iron_helmet": ("iron_layer_2",),
+    "iron_boots": ("iron_layer_2",),
+    "golden_chestplate": ("gold_layer_1",),
+    "golden_leggings": ("gold_layer_1",),
+    "golden_helmet": ("gold_layer_2",),
+    "golden_boots": ("gold_layer_2",),
+}
 
 # Курированные группы: (название, сколько взять, приоритетные имена).
 # Порядок групп = порядок рядов в коллаже: блоки / шерсть / оружие / броня.
@@ -122,8 +152,8 @@ GROUPS = (
         "golden_shovel", "bow", "crossbow", "shield", "trident",
     )),
     ("armor", 4, (
-        "diamond_helmet", "netherite_chestplate", "iron_leggings", "golden_boots",
-        "diamond_chestplate", "turtle_helmet",
+        "diamond_chestplate", "diamond_helmet", "iron_chestplate", "golden_chestplate",
+        "netherite_chestplate", "iron_leggings", "golden_boots", "turtle_helmet",
     )),
 )
 
@@ -141,8 +171,8 @@ def is_junk(png: Path) -> bool:
     return False
 
 
-def build_index(*dirs: Path | None) -> dict[str, Path]:
-    """Индексирует все PNG из переданных папок по имени (без расширения)."""
+def build_index(png_files: list[Path], *dirs: Path | None) -> dict[str, Path]:
+    """Индексирует PNG по имени (без расширения). Папки `dirs` — приоритетные."""
     index: dict[str, Path] = {}
     for directory in dirs:
         if not directory:
@@ -150,30 +180,32 @@ def build_index(*dirs: Path | None) -> dict[str, Path]:
         for png in sorted(directory.rglob("*.png")):
             if png.is_file():
                 index.setdefault(png.stem.lower(), png)
+    for png in sorted(png_files):
+        index.setdefault(png.stem.lower(), png)
     return index
 
 
 def lookup(index: dict[str, Path], name: str) -> Path | None:
-    """Ищет текстуру по имени с учётом легаси-алиасов (шерсть и т.п.)."""
+    """Ищет текстуру по имени с учётом легаси-алиасов (шерсть, броня и т.п.)."""
     if name in index:
         return index[name]
-    alias = ALIASES.get(name)
-    if alias and alias in index:
-        return index[alias]
+    for alias in ALIASES.get(name, ()):
+        if alias in index:
+            return index[alias]
     return None
 
 
 def select_textures(
-    block_dir: Path | None, item_dir: Path | None, limit: int
+    texture_files: list[Path], limit: int
 ) -> list[Path]:
     """
     Подбирает до `limit` текстур для превью.
 
     Сначала берёт курированные категории (блоки, шерсть, оружие, броня),
     затем, если слотов не хватило (кастомный/неполный пак), добирает
-    оставшиеся непустые текстуры из block, а потом из item.
+    оставшиеся непустые текстуры (папка block — в приоритете).
     """
-    index = build_index(block_dir, item_dir)
+    index = build_index(texture_files)
     selected: list[Path] = []
     seen: set[Path] = set()
 
@@ -196,7 +228,7 @@ def select_textures(
     # 2. Добор из общего пула (block приоритетнее item, порядок стабильный)
     if len(selected) < limit:
         pool = [p for p in index.values() if not is_junk(p)]
-        pool.sort(key=lambda p: ("block" not in p.parts, str(p).lower()))
+        pool.sort(key=lambda p: ("block" not in [part.lower() for part in p.parts], str(p).lower()))
         for png in pool:
             if len(selected) >= limit:
                 break
@@ -334,15 +366,14 @@ async def handle_document(message: Message, bot: Bot) -> None:
 
         # 4. Поиск текстур: витрина из узнаваемых категорий (блоки/шерсть/оружие/броня)
         await status.edit_text("🖼 Собираю превью...")
-        block_dir = find_textures_dir(extract_dir, "block")
-        item_dir = find_textures_dir(extract_dir, "item")
+        texture_files = find_texture_files(extract_dir)
 
-        selected = select_textures(block_dir, item_dir, MAX_TEXTURES)
+        selected = select_textures(texture_files, MAX_TEXTURES)
 
         if not selected:
             await status.edit_text(
                 "❌ В архиве не найдено подходящих PNG-текстур "
-                "(textures/block или textures/item)."
+                "(папка textures отсутствует или пуста)."
             )
             return
 
